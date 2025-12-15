@@ -1,7 +1,7 @@
 /*
 ** RingTensor Extension
 ** Description: Complete implementation (No FastPro dependency)
-** Author: Code Gear-1
+** Author: Azzeddine Remmal
 */
 
 #include "ring_tensor.h"
