@@ -1,122 +1,274 @@
-# ⚡ RingTensor Extension
-RingTensor is a high-performance C extension for the Ring programming language, designed specifically to accelerate Deep Learning and Matrix operations. It provides a robust, double-precision mathematical engine that powers the RingML library.
 
-> **Architecture Note:** Unlike standard Ring extensions that operate on Lists, RingTensor uses Memory-Resident Managed Pointers. This enables Zero-Copy arithmetic, making it up to 100x faster for heavy workloads.
+# ⚡ RingTensor Extension (v1.2.0)
 
-## 🚀 Features
-- **Double Precision**: All operations use double (64-bit) to ensure high accuracy for gradients.
-- **Zero-Copy Architecture**: Data stays in C memory. Ring only holds pointers. No expensive marshalling between Ring and C.
-- **Fused Kernels**: Optimizers (Adam, SGD) calculate updates in a single C pass, bypassing interpreter overhead.
+**RingTensor** is a high-performance, memory-resident C extension for the Ring programming language. It serves as the low-level mathematical backend for **RingML**, providing the speed required for Deep Learning, NLP, and Transformer-based models (like GPT).
+
+> **Core Philosophy:** Zero-Copy Architecture. Data resides entirely in C memory (heaps); Ring only handles lightweight pointers. This eliminates data marshalling overhead, achieving near-C speeds.
+
+## 🚀 New in v1.2.0
+- **Multi-Core Processing (OpenMP)**: Automatically distributes heavy matrix operations across CPU cores.
+- **4D Tensor Support**: Native support for logical reshaping `[Batch, Heads, Rows, Cols]`.
+- **Batch Operations**: Specialized kernels for 3D Matrix Multiplication (`BatchMatMul`).
+- **Memory Manipulation**: Blazing fast `memcpy`-based slicing and concatenation for Tensor batches and attention heads.
+
+## ✨ Key Features
+- **Double Precision**: All operations use `double` (64-bit) to ensure high accuracy for gradients.
+- **Fused Kernels**: Optimizers (Adam, SGD) and Attention mechanisms calculate updates in a single C pass, bypassing interpreter overhead.
+- **Broadcasting**: Efficient row/vector broadcasting (e.g., adding Bias to a Batch).
+- **Transformer Ready**: Includes native kernels for Embedding, LayerNorm, and Causal Attention (GPT).
 - **Stability**: Includes Numerically Stable Softmax and safe Division.
+
 ## 📦 Installation
 ```bash
 ringpm install ringtensor from Azzeddine2017
 ```
 
 ## 🛠️ Build Instructions
-To get the maximum performance, we build in Release Mode with full optimizations.
+To enable Multi-Core support, you **must** compile with OpenMP flags.
 
-### Windows (Visual Studio)
-Create buildvc.bat in the extension folder:
+### Windows (Visual Studio / MSVC)
+Create `buildvc.bat` in the extension folder:
 ```bat
 cls
 setlocal enableextensions enabledelayedexpansion
 call ../../language/build/locatevc.bat x64
 
-REM Build with Max Speed (/O2) and Link Time Code Generation (/LTCG)
-cl /c /O2 /Ot /GL /MD ring_tensor.c -I"..\..\language\include"
-link /LTCG /DLL ring_tensor.obj  ..\..\lib\ring.lib kernel32.lib /OUT:..\..\bin\ring_tensor.dll
+REM Build with /openmp for Multi-Threading support
+cl /c /O2 /Ot /GL /MD /openmp ring_tensor.c -I"..\..\language\include"
+link /LTCG /DLL ring_tensor.obj ..\..\lib\ring.lib kernel32.lib /OUT:..\..\bin\ring_tensor.dll
 
 del ring_tensor.obj
 endlocal
 ```
-### Linux / macOS (GCC)
+
+### Linux / macOS (GCC/Clang)
 ```bash
-gcc -shared -o libring_tensor.so -O3 -fPIC ring_tensor.c -I ../../language/include -L ../../lib -lring
+gcc -shared -o libring_tensor.so -O3 -fPIC -fopenmp ring_tensor.c -I ../../language/include -L ../../lib -lring
 ```
+
+
 ## 📚 API Reference
-Note: All functions expect Pointers returned by `tensor_init`, not Ring Lists.
 
-### 1. Lifecycle & Access
+**Note:** All functions expect a **Managed Pointer** returned by `tensor_init`. 1-based indexing is used for API calls to match Ring standards.
 
-| Function | Parameters | Return | Description |
-| :--- | :--- | :--- | :--- |
-| `tensor_init` | Rows, Cols | Pointer | Allocates memory for a new tensor (initialized to 0.0). |
-| `tensor_set` | Ptr, Row, Col, Val | - | Sets a value at (Row, Col). 1-based indexing. |
-| `tensor_get` | Ptr, Row, Col | Number | Gets a value from (Row, Col). |
+### 1. Lifecycle & Shape Management
 
-### 2. Element-Wise Math (In-Place)
-Operations modify the first tensor (A).
-
-| Function | Parameters | Logic |
+| Function | Parameters | Description |
 | :--- | :--- | :--- |
-| `tensor_add` | Ptr A, Ptr B | A += B |
-| `tensor_sub` | Ptr A, Ptr B | A -= B |
-| `tensor_mul_elem` | Ptr A, Ptr B | A *= B (Hadamard) |
-| `tensor_div` | Ptr A, Ptr B | A /= B |
-| `tensor_scalar_mul` | Ptr A, Number n | A *= n |
-| `tensor_add_scalar` | Ptr A, Number n | A += n |
+| `tensor_init` | `rows, cols` | Allocates a new tensor (initialized to 0.0). Returns Pointer. |
+| `tensor_reshape` | `ptr, b, h, r, c` | Logically changes dimensions (4D) without moving data. Use `1` for unused dims. |
+| `tensor_set` | `ptr, r, c, val` | Sets a specific value. |
+| `tensor_get` | `ptr, r, c` | Gets a specific value. |
+
+### 2. High-Performance Memory Ops (Slicing/Concat)
+*Crucial for Batching and Multi-Head Attention.*
+
+| Function | Parameters | Description |
+| :--- | :--- | :--- |
+| `tensor_slice_rows` | `Src, Dest, StartRow, Count` | Copies a block of rows from Src to Dest using `memcpy`. |
+| `tensor_insert_rows` | `Dest, Src, StartRow` | Inserts a block of rows from Src into Dest. |
+| `tensor_select_columns` | `Src, Dest, StartCol, Count` | Copies specific columns (for splitting heads). |
+| `tensor_insert_columns` | `Dest, Src, StartCol` | Inserts columns (for merging heads). |
 
 ### 3. Matrix Operations
 
-| Function | Parameters | Description | Behavior |
+| Function | Description | Notes |
+| :--- | :--- | :--- |
+| `tensor_matmul` | `C = A * B` | Highly optimized, multi-threaded matrix multiplication. |
+| `tensor_matmul_batch` | `C = A * B` (3D) | Performs `[B, N, M] * [B, M, P]` in parallel over batches. |
+| `tensor_transpose` | `C = A.T` | Optimized sequential write transposition. |
+| `tensor_add_row_vec` | `A += Vec` | **Broadcasting:** Adds a vector to every row of the matrix (Bias Add). |
+| `tensor_sum` | `A, Axis, Res` | `Axis=1`: Sum Rows (to Col). `Axis=0`: Sum Cols (to Row - used for Bias Grad). |
+| `tensor_mean` | `A` | Returns the mean value of the entire tensor. |
+| `tensor_argmax` | `A, Res` | Finds the index of the maximum value in each row. |
+
+### 4. Transformer & NLP Kernels (The GPT Engine)
+
+| Function | Parameters | Description |
+| :--- | :--- | :--- |
+| `tensor_embedding_forward` | `Indices, Weights, Out` | High-speed Lookup Table. Converts integer IDs to Vectors. |
+| `tensor_embedding_backward`| `Indices, GradOut, GradW`| Accumulates gradients for embeddings. |
+| `tensor_layernorm` | `In, Gamma, Beta, Out, Eps`| Applies Layer Normalization (Mean/Var normalization + Scale/Shift). |
+| `tensor_attention_fast` | `Q, K, V, Out, Scale` | **Fused Attention:** `Softmax(QK^T / s)V`. Efficient for Encoders. |
+| `tensor_attention_causal` | `Q, K, V, Out, Scale` | **Masked Attention:** Applies `-inf` mask to future tokens. Essential for GPT training. |
+
+### 5. Element-Wise Math (In-Place)
+
+| Function | Logic | Function | Logic |
 | :--- | :--- | :--- | :--- |
-| `tensor_matmul` | Ptr A, Ptr B, Ptr Res | Dot Product (A x B). | Writes to Res. |
-| `tensor_transpose` | Ptr A, Ptr Res | Transposes A. | Writes to Res. |
-| `tensor_sum` | Ptr A, Axis, Ptr Res | 1=Rows, 0=Cols. | Writes to Res. |
-| `tensor_mean` | Ptr A | Mean of all items. | Returns Number. |
-| `tensor_argmax` | Ptr A, Ptr Res | Max index per row. | Writes to Res. |
+| `tensor_add` | `A += B` | `tensor_sub` | `A -= B` |
+| `tensor_mul_elem` | `A *= B` | `tensor_div` | `A /= B` |
+| `tensor_add_scalar` | `A += n` | `tensor_sub_scalar` | `A -= n` |
+| `tensor_scalar_mul` | `A *= n` | `tensor_fill` | `A = n` |
 
-### 4. Transformations & Activations (In-Place)
+### 6. Activation Functions
+*All perform element-wise operations optimized with OpenMP.*
 
-| Function | Formula |
+*   `tensor_sigmoid`, `tensor_sigmoid_prime`
+*   `tensor_tanh`, `tensor_tanh_prime`
+*   `tensor_relu`, `tensor_relu_prime`
+*   `tensor_softmax`: Numerically stable Softmax (Row-wise).
+*   `tensor_square`, `tensor_sqrt`, `tensor_exp`.
+
+### 7. Optimizers (Fused)
+Updates weights inside C to avoid interpreter loop latency.
+
+*   **`tensor_update_adam(W, G, M, V, LR, B1, B2, Eps, T)`**: Full Adam implementation with Bias Correction.
+*   **`tensor_update_sgd(W, G, LR)`**: Standard Stochastic Gradient Descent.
+*   **`tensor_dropout(T, Rate)`**: Randomly zeros out elements for regularization.
+
+### 8. System Utilities
+
+| Function | Description |
 | :--- | :--- |
-| `tensor_fill` | Fills with value n. |
-| `tensor_random` | Fills with 0.0 to 1.0. |
-| `tensor_square` | x^2 |
-| `tensor_sqrt` | sqrt(x) |
-| `tensor_exp` | e^x |
-| `tensor_sigmoid` | 1 / (1 + e^-x) |
-| `tensor_tanh` | tanh(x) |
-| `tensor_relu` | max(0, x) |
-| `tensor_softmax` | Stable Softmax (Exp-Normalize). |
-### 5. Optimizers (Fused Kernels)
-High-performance updates that happen entirely in C.
+| `tensor_get_cores` | Returns the number of logical processors available. |
+| `tensor_set_threads` | Sets the number of OpenMP threads to use. (e.g. `tensor_set_threads(2)`). |
 
-**`tensor_update_sgd`**
+---
+
+## 💻 Usage Example: Multi-Core Control
+
 ```ring
-tensor_update_sgd(Ptr W, Ptr Grad, Number LR)
-```
-**`tensor_update_adam`**
-```ring
-tensor_update_adam(Ptr W, Ptr G, Ptr M, Ptr V, LR, Beta1, Beta2, Eps, T)
-```
-**`tensor_dropout`**
-```ring
-tensor_dropout(Ptr A, Number Rate)
-```
-## 💻 Usage Example
-```ring
-loadlib("ring_tensor.dll") # or .so
+load "ringtensor.ring"
 
-# 1. Create Tensors
-pA = tensor_init(2, 2)
-pB = tensor_init(2, 2)
-pC = tensor_init(2, 2)
+# 1. Check hardware capabilities
+see "Detected Cores: " + tensor_get_cores() + nl
 
-# 2. Set Values
-tensor_fill(pA, 1.0)       # A = [[1,1],[1,1]]
-tensor_set(pB, 1, 1, 5.0)  # B = [[5,0],[0,0]]
+# 2. Performance Tuning
+# For small matrices or dual-core CPUs, limiting threads can improve speed
+# due to reduced overhead. For massive matrices, use max cores.
+tensor_set_threads(2)
 
-# 3. Math (A = A + B)
-tensor_add(pA, pB)         # A becomes [[6,1],[1,1]]
+# 3. Create Tensors
+pA = tensor_init(1000, 1000)
+pB = tensor_init(1000, 1000)
+pC = tensor_init(1000, 1000)
 
-# 4. Matrix Multiplication (C = A * B)
+tensor_random(pA)
+tensor_random(pB)
+
+# 4. Matrix Multiplication (Parallelized)
+t1 = clock()
 tensor_matmul(pA, pB, pC)
-
-# 5. Print Result
-see "Result (1,1): " + tensor_get(pC, 1, 1) + nl
+see "Time: " + (clock()-t1)/clockspersecond() + "s" + nl
 ```
+---
+
+## 🧠 Core Concepts & Examples
+
+### 1. The Basics: Creating & Manipulating Tensors
+All functions return or accept a **Pointer** (`tensor_t*`), not a List.
+
+```ring
+load "ringtensor.ring"
+
+# 1. Allocation (Rows, Cols) - Returns a Pointer
+pA = tensor_init(3, 3) 
+pB = tensor_init(3, 3)
+
+# 2. Fill Data
+tensor_fill(pA, 1.5)        # Fill all with 1.5
+tensor_random(pB)           # Random [0, 1]
+
+# 3. Element-wise Math (In-Place)
+# pA = pA + pB
+tensor_add(pA, pB)
+
+# 4. Access Data (1-based index)
+val = tensor_get(pA, 1, 1)
+see "Value at (1,1): " + val + nl
+```
+
+### 2. Building a Neural Layer (Dense)
+This example simulates `Output = Activation( Input x Weights + Bias )`.
+
+```ring
+# Input: Batch of 32 samples, 64 features
+pInput = tensor_init(32, 64)
+tensor_random(pInput)
+
+# Weights: 64 inputs -> 128 neurons
+pWeights = tensor_init(64, 128)
+tensor_random(pWeights)
+
+# Bias: 128 neurons (Row Vector)
+pBias = tensor_init(1, 128)
+tensor_random(pBias)
+
+# Output Container
+pOutput = tensor_init(32, 128)
+
+# --- The Forward Pass ---
+
+# 1. Matrix Multiplication (Heavy Lifting)
+# Uses OpenMP to distribute 32 samples across cores
+tensor_matmul(pInput, pWeights, pOutput)
+
+# 2. Broadcasting (Add Bias to every row)
+tensor_add_row_vec(pOutput, pBias)
+
+# 3. Activation (ReLU)
+tensor_relu(pOutput)
+
+see "Forward Pass Complete." + nl
+```
+
+### 3. The GPT Engine (NLP Kernels)
+RingTensor v1.2.0 introduces specialized kernels for Transformer models (like BERT and GPT).
+
+#### A. Embedding Lookup
+Converts integer tokens to dense vectors instantly.
+```ring
+# Vocabulary: 1000 words, Dim: 50
+pEmbedWeights = tensor_init(1000, 50) 
+
+# Input Sentence: [5, 20, 99] (Indices)
+pIndices = tensor_init(1, 3)
+tensor_set(pIndices, 1, 1, 5)
+tensor_set(pIndices, 1, 2, 20)
+# ...
+
+# Output Container
+pVectors = tensor_init(3, 50)
+
+# Fast Lookup
+tensor_embedding_forward(pIndices, pEmbedWeights, pVectors)
+```
+
+#### B. Causal Attention (The "Brain" of GPT)
+Performs `Softmax( Q.K^T / scale ) . V` with masking to prevent looking at future tokens.
+
+```ring
+# Context: Sequence Length 10, Embedding Dim 64
+pQ = tensor_init(10, 64)
+pK = tensor_init(10, 64)
+pV = tensor_init(10, 64)
+pOut = tensor_init(10, 64)
+
+# Run Fused Kernel
+# Automatically handles Matrix Mul, Scaling, Masking, Softmax, and Context Mixing
+tensor_attention_causal(pQ, pK, pV, pOut, 0.125)
+```
+
+---
+
+#### ⚡ Performance Tuning (Multi-Threading)
+
+RingTensor uses **OpenMP** to parallelize operations. However, for small matrices, the overhead of creating threads might be slower than serial execution.
+
+```ring
+# 1. Check Hardware
+nCores = tensor_get_cores()
+see "CPU Cores Detected: " + nCores + nl
+
+# 2. Optimize
+# If you are training small networks or using a dual-core CPU with Hyperthreading,
+# limiting threads often yields better performance.
+tensor_set_threads(2) 
+```
+
+---
+
 ## ⚠️ Important Notes
 - **Memory Management**: Pointers returned by `tensor_init` are Managed Pointers. Ring's Garbage Collector will automatically call `free()` when the variable goes out of scope. You do not need to free them manually.
 - **Dimensions**: Ensure dimensions match for operations like `add` or `matmul`, otherwise the extension may throw a runtime error.

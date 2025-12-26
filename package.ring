@@ -5,11 +5,11 @@ aPackageInfo = [
 	:developer = "Azzeddine Remmal",
 	:email = "azzeddine.remmal@gmail.com",
 	:license = "MIT License",
-	:version = "1.1.0",
+	:version = "1.2.0",
 	:ringversion = "1.24",
 	:versions = 	[
 		[
-			:version = "1.1.0",
+			:version = "1.2.0",
 			:branch = "master"
 		]
 	],
@@ -21,9 +21,9 @@ aPackageInfo = [
 		]
 	],
 	:files = 	[
-		"setup.ring",
 		"main.ring",
-		"README.md"
+		"README.md",
+		"setup.ring"
 	],
 	:ringfolderfiles = 	[
 		"bin/load/ringtensor.ring",
@@ -36,6 +36,7 @@ aPackageInfo = [
 		"extensions/ringtensor/buildvc_max_sped_x64.bat",
 		"extensions/ringtensor/buildvc_x64.bat",
 		"extensions/ringtensor/README.md",
+		"extensions/ringtensor/RingTensor.md",
 		"extensions/ringtensor/ringtensor.ring",
 		"extensions/ringtensor/ring_tensor.c",
 		"extensions/ringtensor/ring_tensor.h",
