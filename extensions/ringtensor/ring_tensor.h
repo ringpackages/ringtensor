@@ -249,6 +249,7 @@ RING_FUNC(ring_tensor_get);
 /* Properties */
 RING_FUNC(ring_tensor_get_rows);
 RING_FUNC(ring_tensor_get_cols);
+RING_FUNC(ring_tensor_dot_row_vec);
 
 /* 2. Element-Wise Math (In-Place / Parallelized) */
 RING_FUNC(ring_tensor_add);
@@ -286,6 +287,9 @@ RING_FUNC(ring_tensor_embedding_forward);
 RING_FUNC(ring_tensor_embedding_backward);
 
 RING_FUNC(ring_tensor_layernorm);
+RING_FUNC(ring_tensor_rmsnorm);
+RING_FUNC(ring_tensor_rope);
+RING_FUNC(ring_tensor_silu);
 
 RING_FUNC(ring_tensor_attention_fast);   
 RING_FUNC(ring_tensor_attention_causal); 
@@ -310,6 +314,7 @@ RING_FUNC(ring_tensor_crossentropy_backward);
 RING_FUNC(ring_tensor_get_cores);
 RING_FUNC(ring_tensor_set_threads);
 RING_FUNC(ring_tensor_set_gpu_threshold);
+RING_FUNC(ring_tensor_set_arena_size);
 
 
 RING_FUNC(ring_tensor_set_from_list);

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.3.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.3.4-blue.svg)
 ![Ring](https://img.shields.io/badge/Ring-1.25+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
@@ -623,40 +623,10 @@ RingTensor draws inspiration from:
 - 👀 **Watch releases** for new versions
 - 🔔 **Follow** for project announcements
 
----
-
-## 🗺️ Roadmap
-
-### Upcoming Features (v1.4.0)
-
-- [ ] **Vulkan Backend**: Modern GPU compute API
-- [ ] **Mixed Precision Training**: FP16/BF16 support
-- [ ] **Distributed Training**: Multi-GPU and multi-node
-- [ ] **Model Quantization**: INT8 inference
-- [ ] **ONNX Export**: Interoperability with other frameworks
-- [ ] **JIT Compilation**: Runtime optimization
-- [ ] **Sparse Tensors**: Efficient sparse matrix operations
-
-### Long-term Vision
-
-- Full transformer model implementations (GPT, BERT, T5)
-- Computer vision operations (convolutions, pooling)
-- Reinforcement learning primitives
-- Graph neural networks support
-- AutoML capabilities
 
 ---
 
-## 📊 Project Statistics
 
-- **Lines of Code**: ~4,500 (C) + ~2,000 (Ring)
-- **Functions**: 100+ tensor operations
-- **Test Coverage**: 85%+
-- **Performance**: Up to 100x speedup vs. pure Ring
-- **Platforms**: Windows, Linux, macOS
-- **GPU Support**: NVIDIA, AMD, Intel
-
----
 
 ## 🌟 Showcase
 
@@ -709,7 +679,7 @@ RingTensor draws inspiration from:
 
 ## 📈 Version History
 
-**Current Version:** 1.3.2 (2026-01-26)
+**Current Version:** 1.3.4 (2026-05-07)
 
 For detailed version history and upgrade guides, see [CHANGELOG.md](CHANGELOG.md)
 
@@ -741,8 +711,8 @@ For detailed version history and upgrade guides, see [CHANGELOG.md](CHANGELOG.md
 
 ---
 
-**Last Updated:** 2026-01-26  
-**Version:** 1.3.2 
+**Last Updated:** 2026-05-07  
+**Version:** 1.3.4
 **License:** MIT
 
 </div>

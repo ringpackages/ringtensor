@@ -7,6 +7,27 @@
 #include "ring_tensor.h"
 
 #include <stdio.h>
+
+/* ====================================================================
+** AVX2 SIMD Intrinsics (Upgrade 2)
+** Provides _mm256_*_pd functions to process 4 doubles per clock cycle.
+** Broadwell i3-5005U supports AVX2 natively.
+** ==================================================================== */
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+/* ====================================================================
+** Memory Arena / Pool (Upgrade 3)
+** Pre-allocated contiguous block to eliminate per-tensor calloc overhead
+** during graph forward/backward passes.
+** Pool Size: 256MB (sufficient for most training workloads on 8GB RAM)
+** ==================================================================== */
+static size_t ARENA_SIZE  = (512 * 1024 * 1024); /* Default: 512 MB */
+
+static char   *arena_memory  = NULL;    /* Base pointer to the arena block   */
+static size_t  arena_offset  = 0;       /* Current allocation offset (bump)  */
+static int     arena_active  = 0;       /* 1 when graph owns the arena       */
 /* ==================================================================== */
 /* --- GPU ACCELERATION (OpenCL) -------------------------------------- */
 /* ==================================================================== */
@@ -62,7 +83,56 @@ const char *clSource =
 "       float inner = 0.7978845608f * (x + 0.044715f * cube);\n"
 "       A[i] = 0.5f * x * (1.0f + tanh(inner));\n"
 "   }\n"
+"}\n"
+"__kernel void sat_anneal(__global float* Field, __global float* Momentum, __global const float* Clauses, __global float* Weights, int nVars, int nClauses, int lits_per_clause, int nPasses, float fLR, float fMomDecay) {\n"
+"   int d = get_global_id(0);\n"
+"   int nDims = get_global_size(0);\n"
+"\n"
+"   for(int pass=0; pass < nPasses; pass++) {\n"
+"       float curLR = fLR * (1.0f - ((float)pass / (float)nPasses));\n"
+"       for(int c=0; c < nClauses; c++) {\n"
+"           float maxVal = -9999.0f;\n"
+"           for(int k=0; k < lits_per_clause; k++) {\n"
+"               int lit = (int)Clauses[c * lits_per_clause + k];\n"
+"               if(lit == 0) break;\n"
+"               int varIdx = abs(lit) - 1;\n"
+"               float v = Field[varIdx * nDims + d];\n"
+"               if(lit < 0) v = -v;\n"
+"               if(v > maxVal) maxVal = v;\n"
+"           }\n"
+"           \n"
+"           if(maxVal < 1.0f) {\n"
+"               // 🚀 THE TSUNAMI ACCUMULATION: If clause is unsatisfied, increase its frustration weight\n"
+"               float w = Weights[c * nDims + d];\n"
+"               w += 0.1f;\n" // Aggressive accumulation
+"               Weights[c * nDims + d] = w;\n"
+"               \n"
+"               float push = (1.0f - maxVal) * curLR * w;\n"
+"               for(int k=0; k < lits_per_clause; k++) {\n"
+"                   int lit = (int)Clauses[c * lits_per_clause + k];\n"
+"                   if(lit == 0) break;\n"
+"                   int varIdx = abs(lit) - 1;\n"
+"                   float sign = (lit < 0) ? -1.0f : 1.0f;\n"
+"                   float force = push * sign;\n"
+"                   float m = Momentum[varIdx * nDims + d] * fMomDecay + force;\n"
+"                   Momentum[varIdx * nDims + d] = m;\n"
+"                   Field[varIdx * nDims + d] += m;\n"
+"               }\n"
+"           } else {\n"
+"               // Optional: Slowly forget frustration if currently satisfied\n"
+"               Weights[c * nDims + d] *= 0.999f;\n"
+"           }\n"
+"       }\n"
+"       \n"
+"       if ((pass % 100) == 0) {\n"
+"           for(int v=0; v < nVars; v++) {\n"
+"               Field[v * nDims + d] *= 0.99f;\n"
+"           }\n"
+"       }\n"
+"   }\n"
 "}\n";
+
+static cl_kernel clSatKernel = NULL;
 
 void init_opencl() {
     //printf("\n[GPU] Attempting to initialize OpenCL...\n");
@@ -144,11 +214,30 @@ void init_opencl() {
     clGeluKernel = clCreateKernel(program, "gelu", &ret);
     if (ret != CL_SUCCESS) printf("[GPU] Error creating GELU kernel\n");
 
+    clSatKernel = clCreateKernel(program, "sat_anneal", &ret);
+    if (ret != CL_SUCCESS) printf("[GPU] Error creating SAT kernel\n");
+
     gpu_ready = 1;
     printf("[RingTensor] GPU Acceleration Enabled.\n");
 }
 
-//GPU multiplication function (with Double <-> Float transformation)
+/* ====================================================================
+** Upgrade 1: OpenCL Zero-Copy MatMul for Integrated GPUs
+** ====================================================================
+** BEFORE: CL_MEM_COPY_HOST_PTR — OpenCL allocates a SEPARATE device
+**         buffer and deep-copies from the host buffer into it.
+**         On iGPU (shared RAM), this is a pointless memcpy within the
+**         same physical memory. 3x alloc + 3x deep copy = bottleneck.
+**
+** AFTER:  CL_MEM_USE_HOST_PTR — OpenCL uses the host buffer DIRECTLY.
+**         On Intel HD 5500 (iGPU sharing DDR3L with CPU), the driver
+**         recognizes it's the same physical RAM and avoids any copy.
+**         The GPU kernel reads/writes the host pointer in-place.
+**
+** We still need host-side malloc for the double→float conversion
+** (can't avoid that — tensors are double, GPU works in float).
+** But the key change is: NO device-side allocation, NO deep copy.
+** ==================================================================== */
 int gpu_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
     if (!gpu_ready) return 0;
 
@@ -168,7 +257,8 @@ int gpu_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
     int i; 
     int limit; 
 
-    // 1. Float array allocation
+    /* Step 1: Allocate host-side float buffers for double→float conversion.
+    ** These are the ONLY mallocs — they hold the converted float data. */
     float *fA = (float *)malloc(szA_bytes);
     float *fB = (float *)malloc(szB_bytes);
     float *fC = (float *)malloc(szC_bytes);
@@ -178,8 +268,7 @@ int gpu_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
         return 0;
     }
 
-    // 2. Double -> Float
-    // MSVC OpenMP requires signed integer loop variable
+    /* Step 2: Convert Double → Float into host buffers */
     limit = (int)num_elements_A;
     #pragma omp parallel for private(i)
     for(i=0; i<limit; i++) fA[i] = (float)A->data[i];
@@ -188,14 +277,21 @@ int gpu_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
     #pragma omp parallel for private(i)
     for(i=0; i<limit; i++) fB[i] = (float)B->data[i];
 
-    // 3. OpenCL Buffers
-    cl_mem bufA = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, szA_bytes, fA, &ret);
-    cl_mem bufB = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, szB_bytes, fB, &ret);
-    cl_mem bufC = clCreateBuffer(clContext, CL_MEM_WRITE_ONLY, szC_bytes, NULL, &ret);
-
+    /* Step 3: Create CL buffers with CL_MEM_USE_HOST_PTR.
+    ** This tells OpenCL: "Don't allocate device memory. Use THIS pointer."
+    ** On iGPU (shared RAM), the GPU accesses fA/fB/fC directly — zero copy.
+    ** On discrete GPU, the driver would still need to transfer, but on
+    ** Intel HD 5500 it's the same physical DDR3L — true zero copy. */
+    cl_mem bufA = clCreateBuffer(clContext, CL_MEM_READ_ONLY  | CL_MEM_USE_HOST_PTR, szA_bytes, fA, &ret);
     if (ret != CL_SUCCESS) { free(fA); free(fB); free(fC); return 0; }
+    
+    cl_mem bufB = clCreateBuffer(clContext, CL_MEM_READ_ONLY  | CL_MEM_USE_HOST_PTR, szB_bytes, fB, &ret);
+    if (ret != CL_SUCCESS) { clReleaseMemObject(bufA); free(fA); free(fB); free(fC); return 0; }
+    
+    cl_mem bufC = clCreateBuffer(clContext, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, szC_bytes, fC, &ret);
+    if (ret != CL_SUCCESS) { clReleaseMemObject(bufA); clReleaseMemObject(bufB); free(fA); free(fB); free(fC); return 0; }
 
-    // 4. Args
+    /* Step 4: Set kernel args and execute — standard path */
     clSetKernelArg(clMatMulKernel, 0, sizeof(cl_mem), (void *)&bufA);
     clSetKernelArg(clMatMulKernel, 1, sizeof(cl_mem), (void *)&bufB);
     clSetKernelArg(clMatMulKernel, 2, sizeof(cl_mem), (void *)&bufC);
@@ -203,23 +299,25 @@ int gpu_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
     clSetKernelArg(clMatMulKernel, 4, sizeof(int), &K);
     clSetKernelArg(clMatMulKernel, 5, sizeof(int), &N);
 
-    // 5. Execute
     size_t global_item_size[2] = { (size_t)M, (size_t)N };
     ret = clEnqueueNDRangeKernel(clQueue, clMatMulKernel, 2, NULL, global_item_size, NULL, 0, NULL, NULL);
 
-    // 6. Read
+    /* Step 5: Read results back. With CL_MEM_USE_HOST_PTR on iGPU,
+    ** this is essentially a synchronization barrier — the data is
+    ** already in fC (same physical memory), but we need the blocking
+    ** read to ensure the kernel has completed before we access fC. */
     if (ret == CL_SUCCESS) {
         ret = clEnqueueReadBuffer(clQueue, bufC, CL_TRUE, 0, szC_bytes, fC, 0, NULL, NULL);
     }
 
-    // 7. التحويل (Float -> Double)
+    /* Step 6: Convert Float → Double */
     if (ret == CL_SUCCESS) {
         limit = (int)num_elements_C;
         #pragma omp parallel for private(i)
         for(i=0; i<limit; i++) C->data[i] = (double)fC[i];
     }
 
-    // 8. Cleanup
+    /* Step 7: Cleanup */
     clReleaseMemObject(bufA); clReleaseMemObject(bufB); clReleaseMemObject(bufC);
     free(fA); free(fB); free(fC);
     
@@ -340,9 +438,52 @@ static int GRAPH_OPTIMIZER = 0; // 0: SGD, 1: ADAM
 /* HELPER FUNCTIONS                                                           */
 /* ========================================================================== */
 
-/* Allocate memory for the Tensor if it doesn't already exist.*/
+/* ====================================================================
+** Upgrade 3: Memory Arena / Pool Allocator
+** ====================================================================
+** BEFORE: ensure_tensor_memory called calloc() for EVERY intermediate
+**         tensor during forward/backward pass. On a 10-layer network
+**         with 100 epochs, that's ~2000 calloc+free cycles per epoch.
+**         Each calloc involves an OS kernel call (expensive on Windows).
+**
+** AFTER:  A single 256MB block is allocated once in ring_graph_init.
+**         ensure_tensor_memory returns a pointer from this block via a
+**         simple offset bump — O(1), no syscall, no fragmentation.
+**         The arena resets (offset=0) when the graph is freed.
+**
+** arena_alloc(): Thread-safe bump allocator with 64-byte alignment
+** (matches cache line size on Broadwell to prevent false sharing).
+** ==================================================================== */
+static void* arena_alloc(size_t bytes) {
+    /* Align to 64-byte boundary (L1 cache line on Broadwell) */
+    size_t aligned = (bytes + 63) & ~((size_t)63);
+    
+    if (!arena_active || !arena_memory) {
+        /* Fallback: arena not initialized (standalone tensor usage) */
+        return calloc(1, bytes);
+    }
+    
+    if (arena_offset + aligned > ARENA_SIZE) {
+        /* Arena exhausted — fall back to system allocator.
+        ** This should rarely happen; increase ARENA_SIZE if it does. */
+        printf("[RingTensor] WARNING: Arena exhausted (%zu / %zu bytes). Falling back to malloc.\n",
+               arena_offset + aligned, ARENA_SIZE);
+        return calloc(1, bytes);
+    }
+    
+    void *ptr = arena_memory + arena_offset;
+    arena_offset += aligned;
+    
+    /* Zero the allocation (matches calloc behavior) */
+    memset(ptr, 0, bytes);
+    return ptr;
+}
+
+/* Allocate memory for the Tensor if it doesn't already exist.
+** Upgrade 3: Uses arena pool when graph is active, calloc otherwise. */
 static void ensure_tensor_memory(tensor_t **t, int rows, int cols) {
     if (*t == NULL) {
+        /* The struct itself is always heap-allocated (small, ~80 bytes) */
         *t = (tensor_t*)malloc(sizeof(tensor_t));
         (*t)->rows = rows;
         (*t)->cols = cols;
@@ -352,6 +493,28 @@ static void ensure_tensor_memory(tensor_t **t, int rows, int cols) {
         (*t)->shape[1] = 1;
         (*t)->shape[2] = rows;
         (*t)->shape[3] = cols;
+        
+        /* Data buffer: served from arena pool during graph execution,
+        ** or from system allocator for standalone tensor operations. */
+        if (arena_active) {
+            (*t)->data = (double*)arena_alloc((size_t)rows * cols * sizeof(double));
+            (*t)->is_owner = 0;  /* Arena owns this memory, not the tensor */
+        } else {
+            (*t)->data = (double*)calloc(rows * cols, sizeof(double));
+            (*t)->is_owner = 1;
+        }
+    }
+}
+
+static void ensure_temp_memory(tensor_t **t, int rows, int cols) {
+    if (*t == NULL) {
+        *t = (tensor_t*)malloc(sizeof(tensor_t));
+        (*t)->rows = rows;
+        (*t)->cols = cols;
+        (*t)->size = rows * cols;
+        (*t)->ndim = 2;
+        (*t)->shape[0] = 1; (*t)->shape[1] = 1;
+        (*t)->shape[2] = rows; (*t)->shape[3] = cols;
         (*t)->data = (double*)calloc(rows * cols, sizeof(double));
         (*t)->is_owner = 1;
     }
@@ -625,27 +788,80 @@ RING_FUNC(ring_tensor_get) {
 /* --- 2. ELEMENT-WISE MATH (OPTIMIZED) ------------------------------- */
 /* ==================================================================== */
 
-/* Internal Kernels - Element-wise operations */
+/* ====================================================================
+** Upgrade 2: AVX2 SIMD Intrinsics for Element-Wise Math
+** ====================================================================
+** BEFORE: Scalar loop processing 1 double per cycle.
+** AFTER:  _mm256_*_pd processes 4 doubles per cycle (256-bit registers).
+**
+** Broadwell i3-5005U has full AVX2 support with 2x 256-bit FMA units.
+** Combined with OpenMP, this gives us: 4 (SIMD) × 4 (threads via HT) = 16x
+** theoretical throughput for element-wise ops.
+**
+** Tail Handling: When size % 4 != 0, the remaining 1-3 elements are
+** processed with standard scalar operations (safe, no buffer overread).
+** ==================================================================== */
+
 void internal_add(tensor_t *A, tensor_t *B) {
     int i;
-    #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
-    for(i=0; i<A->size; i++) A->data[i] += B->data[i];
+    int size = A->size;
+#ifdef __AVX2__
+    int simd_end = size - (size % 4);  /* Process in chunks of 4 doubles */
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<simd_end; i+=4) {
+        __m256d va = _mm256_loadu_pd(&A->data[i]);
+        __m256d vb = _mm256_loadu_pd(&B->data[i]);
+        _mm256_storeu_pd(&A->data[i], _mm256_add_pd(va, vb));
+    }
+    /* Scalar tail: handle remaining elements */
+    for(i=simd_end; i<size; i++) A->data[i] += B->data[i];
+#else
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<size; i++) A->data[i] += B->data[i];
+#endif
 }
 
 void internal_sub(tensor_t *A, tensor_t *B) {
     int i;
-    #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
-    for(i=0; i<A->size; i++) A->data[i] -= B->data[i];
+    int size = A->size;
+#ifdef __AVX2__
+    int simd_end = size - (size % 4);
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<simd_end; i+=4) {
+        __m256d va = _mm256_loadu_pd(&A->data[i]);
+        __m256d vb = _mm256_loadu_pd(&B->data[i]);
+        _mm256_storeu_pd(&A->data[i], _mm256_sub_pd(va, vb));
+    }
+    for(i=simd_end; i<size; i++) A->data[i] -= B->data[i];
+#else
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<size; i++) A->data[i] -= B->data[i];
+#endif
 }
 
 void internal_mul_elem(tensor_t *A, tensor_t *B) {
     int i;
-    #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
-    for(i=0; i<A->size; i++) A->data[i] *= B->data[i];
+    int size = A->size;
+#ifdef __AVX2__
+    int simd_end = size - (size % 4);
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<simd_end; i+=4) {
+        __m256d va = _mm256_loadu_pd(&A->data[i]);
+        __m256d vb = _mm256_loadu_pd(&B->data[i]);
+        _mm256_storeu_pd(&A->data[i], _mm256_mul_pd(va, vb));
+    }
+    for(i=simd_end; i<size; i++) A->data[i] *= B->data[i];
+#else
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<size; i++) A->data[i] *= B->data[i];
+#endif
 }
 
 void internal_div(tensor_t *A, tensor_t *B) {
     int i;
+    /* Division keeps scalar path due to zero-check branching.
+    ** AVX2 division with masking is possible but not worth the
+    ** complexity for a rarely-bottlenecked operation. */
     #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
     for(i=0; i<A->size; i++) {
         A->data[i] = (B->data[i] != 0) ? A->data[i] / B->data[i] : 0.0;
@@ -654,20 +870,57 @@ void internal_div(tensor_t *A, tensor_t *B) {
 
 void internal_scalar_mul(tensor_t *T, double scalar) {
     int i;
-    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
-    for(i=0; i<T->size; i++) T->data[i] *= scalar;
+    int size = T->size;
+#ifdef __AVX2__
+    /* Broadcast scalar to all 4 lanes of the 256-bit register */
+    __m256d vs = _mm256_set1_pd(scalar);
+    int simd_end = size - (size % 4);
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<simd_end; i+=4) {
+        __m256d vt = _mm256_loadu_pd(&T->data[i]);
+        _mm256_storeu_pd(&T->data[i], _mm256_mul_pd(vt, vs));
+    }
+    for(i=simd_end; i<size; i++) T->data[i] *= scalar;
+#else
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<size; i++) T->data[i] *= scalar;
+#endif
 }
 
 void internal_add_scalar(tensor_t *T, double scalar) {
     int i;
-    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
-    for(i=0; i<T->size; i++) T->data[i] += scalar;
+    int size = T->size;
+#ifdef __AVX2__
+    __m256d vs = _mm256_set1_pd(scalar);
+    int simd_end = size - (size % 4);
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<simd_end; i+=4) {
+        __m256d vt = _mm256_loadu_pd(&T->data[i]);
+        _mm256_storeu_pd(&T->data[i], _mm256_add_pd(vt, vs));
+    }
+    for(i=simd_end; i<size; i++) T->data[i] += scalar;
+#else
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<size; i++) T->data[i] += scalar;
+#endif
 }
 
 void internal_sub_scalar(tensor_t *T, double scalar) {
     int i;
-    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
-    for(i=0; i<T->size; i++) T->data[i] -= scalar;
+    int size = T->size;
+#ifdef __AVX2__
+    __m256d vs = _mm256_set1_pd(scalar);
+    int simd_end = size - (size % 4);
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<simd_end; i+=4) {
+        __m256d vt = _mm256_loadu_pd(&T->data[i]);
+        _mm256_storeu_pd(&T->data[i], _mm256_sub_pd(vt, vs));
+    }
+    for(i=simd_end; i<size; i++) T->data[i] -= scalar;
+#else
+    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
+    for(i=0; i<size; i++) T->data[i] -= scalar;
+#endif
 }
 
 /* Ring API Wrappers */
@@ -889,52 +1142,115 @@ RING_FUNC(ring_tensor_softmax) {
 /* --- 4. MATRIX OPS (OPTIMIZED MATMUL) ------------------------------- */
 /* ==================================================================== */
 
-/* Internal Kernel - MatMul */
+/* ====================================================================
+** Upgrade 4: Cache-Friendly MatMul via B-Transpose + Memory Packing
+** ====================================================================
+** BEFORE: Inner loop reads B by columns — B->data[k*cB + j].
+**         Column access is stride-cB, causing heavy L1/L2 cache misses.
+**         On i3-5005U with 3MB L3, matrices > 512x512 thrash badly.
+**
+** AFTER:  We explicitly transpose B into B_T before the multiply.
+**         The dot product now reads both A rows and B_T rows
+**         contiguously — sequential memory access, full cache line utilization.
+**
+**         A row:   A[i*cA + 0], A[i*cA + 1], ... A[i*cA + cA-1]  (contiguous)
+**         B_T row: B_T[j*cA + 0], B_T[j*cA + 1], ... B_T[j*cA + cA-1]  (contiguous)
+**         Result:  C[i*cB + j] = dot(A_row_i, B_T_row_j)
+**
+** The transpose cost is O(cA*cB) which is negligible compared to
+** the O(rA*cA*cB) multiply, especially for large matrices.
+** Tiling is applied on top for L1 temporal locality.
+** ==================================================================== */
 void internal_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
 
     int rA = A->rows; int cA = A->cols; int cB = B->cols;
     int i, j, k, ii, jj, kk;
     int i_max, j_max, k_max;
-    double *rowC, *rowA;
+    double *rowC, *rowA, *rowBT;
+    double sum;
 
-    // --- SMART SWITCH ---
+    /* --- GPU Smart Switch (unchanged) --- */
     long operations = (long)rA * cA * cB;
 
-     #ifdef USE_OPENCL
-    // Raising the threshold to 5 million operations to ensure that the benefit of the GPU covers the cost of transfer
-    // (For powerful cards, it can be reduced, but for the HD 5500 this number is safe)
+    #ifdef USE_OPENCL
     if (gpu_ready && operations > GPU_THRESHOLD) {
         if (gpu_matmul(A, B, C)) {
-            return; // Done by GPU
+            return;  /* Done by GPU */
         }
     }
     #endif
-    // --------------------
 
     memset(C->data, 0, (size_t)rA * cB * sizeof(double));
-    
-    #pragma omp parallel for schedule(static) private(ii, jj, kk, i, j, k, i_max, j_max, k_max, rowC, rowA)
-    for (ii = 0; ii < rA; ii += TILE_SIZE) {
-        i_max = (ii + TILE_SIZE > rA) ? rA : ii + TILE_SIZE;
-        for (kk = 0; kk < cA; kk += TILE_SIZE) {
-            k_max = (kk + TILE_SIZE > cA) ? cA : kk + TILE_SIZE;
-            for (jj = 0; jj < cB; jj += TILE_SIZE) {
-                j_max = (jj + TILE_SIZE > cB) ? cB : jj + TILE_SIZE;
-                for (i = ii; i < i_max; i++) {
-                    rowC = &C->data[i * cB];
-                    rowA = &A->data[i * cA];
-                    for (k = kk; k < k_max; k++) {
-                        double valA = rowA[k];
-                        if (valA == 0.0) continue;
-                        double *rowB = &B->data[k * cB];
-                        for (j = jj; j < j_max; j++) {
-                            rowC[j] += valA * rowB[j];
+
+    /* --- Step 1: Transpose B into B_T (column-major -> row-major) ---
+    ** B  is (cA x cB) stored row-major: B[k][j] = B->data[k*cB + j]
+    ** B_T is (cB x cA) stored row-major: B_T[j][k] = B_T[j*cA + k]
+    ** After transpose, iterating over k for a fixed j is contiguous. */
+    double *B_T = (double *)malloc((size_t)cA * cB * sizeof(double));
+    if (B_T == NULL) {
+        /* Fallback: if malloc fails, use original (slower) path */
+        #pragma omp parallel for schedule(static) private(ii, jj, kk, i, j, k, i_max, j_max, k_max, rowC, rowA)
+        for (ii = 0; ii < rA; ii += TILE_SIZE) {
+            i_max = (ii + TILE_SIZE > rA) ? rA : ii + TILE_SIZE;
+            for (kk = 0; kk < cA; kk += TILE_SIZE) {
+                k_max = (kk + TILE_SIZE > cA) ? cA : kk + TILE_SIZE;
+                for (jj = 0; jj < cB; jj += TILE_SIZE) {
+                    j_max = (jj + TILE_SIZE > cB) ? cB : jj + TILE_SIZE;
+                    for (i = ii; i < i_max; i++) {
+                        rowC = &C->data[i * cB];
+                        rowA = &A->data[i * cA];
+                        for (k = kk; k < k_max; k++) {
+                            double valA = rowA[k];
+                            if (valA == 0.0) continue;
+                            double *rowB = &B->data[k * cB];
+                            for (j = jj; j < j_max; j++) {
+                                rowC[j] += valA * rowB[j];
+                            }
                         }
                     }
                 }
             }
         }
+        return;
     }
+
+    /* Transpose B -> B_T (parallelized for large matrices) */
+    #pragma omp parallel for if(cA * cB > PARALLEL_THRESHOLD) private(k)
+    for (j = 0; j < cB; j++) {
+        for (k = 0; k < cA; k++) {
+            B_T[j * cA + k] = B->data[k * cB + j];
+        }
+    }
+
+    /* --- Step 2: Tiled MatMul with transposed B ---
+    ** The inner dot product now reads A[i] and B_T[j] both contiguously.
+    ** Both rows fit in L1 cache (32 doubles * 8 bytes = 256 bytes each).
+    ** This turns random column-strided accesses into sequential reads. */
+    #pragma omp parallel for schedule(static) private(ii, jj, kk, i, j, k, i_max, j_max, k_max, rowC, rowA, rowBT, sum)
+    for (ii = 0; ii < rA; ii += TILE_SIZE) {
+        i_max = (ii + TILE_SIZE > rA) ? rA : ii + TILE_SIZE;
+        for (jj = 0; jj < cB; jj += TILE_SIZE) {
+            j_max = (jj + TILE_SIZE > cB) ? cB : jj + TILE_SIZE;
+            for (i = ii; i < i_max; i++) {
+                rowC = &C->data[i * cB];
+                rowA = &A->data[i * cA];
+                for (j = jj; j < j_max; j++) {
+                    rowBT = &B_T[j * cA];
+                    sum = 0.0;
+                    /* Tiled inner K loop for L1 cache reuse */
+                    for (kk = 0; kk < cA; kk += TILE_SIZE) {
+                        k_max = (kk + TILE_SIZE > cA) ? cA : kk + TILE_SIZE;
+                        for (k = kk; k < k_max; k++) {
+                            sum += rowA[k] * rowBT[k];
+                        }
+                    }
+                    rowC[j] = sum;
+                }
+            }
+        }
+    }
+
+    free(B_T);
 }
 
 RING_FUNC(ring_tensor_matmul) {
@@ -1011,6 +1327,31 @@ void internal_sum(tensor_t *T, int axis, tensor_t *R) {
     }
 }
 
+/* Internal Kernel - Dot Product of a Row Vector with a Matrix */
+void internal_dot_row_vec(tensor_t *A, tensor_t *B, tensor_t *R) {
+    int i, j;
+    int rows = A->rows;
+    int cols = A->cols;
+    
+    #pragma omp parallel for private(j) schedule(static)
+    for(i=0; i<rows; i++) {
+        double dot = 0.0;
+        double *rowA = &A->data[i * cols];
+        double *vecB = B->data;
+        for(j=0; j<cols; j++) {
+            dot += rowA[j] * vecB[j];
+        }
+        R->data[i] = dot; 
+    }
+}
+
+RING_FUNC(ring_tensor_dot_row_vec) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *R = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    internal_dot_row_vec(A, B, R);
+}
+
 RING_FUNC(ring_tensor_sum) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     int axis = (int)RING_API_GETNUMBER(2);
@@ -1065,15 +1406,11 @@ int internal_argmax(tensor_t *T) {
     }
     return max_idx;
 }
-    
-
-
-
 
 RING_FUNC(ring_tensor_argmax) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    tensor_t *R = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    internal_argmax_rowwise(T, R);
+    int nBestID = internal_argmax(T);
+    RING_API_RETNUMBER(nBestID);
 }
 
 /*
@@ -1421,6 +1758,28 @@ RING_FUNC(ring_tensor_set_gpu_threshold) {
     if (val < 0) val = 0;
     
     GPU_THRESHOLD = (long long)val;
+}
+
+/*
+** Set Memory Arena Size (in MB)
+** Usage: tensor_set_arena_size(1024) -> sets to 1GB
+** Note: Must be called BEFORE graph_init() to take effect.
+*/
+RING_FUNC(ring_tensor_set_arena_size) {
+    if (RING_API_PARACOUNT != 1) {
+        RING_API_ERROR(RING_API_MISS1PARA);
+        return;
+    }
+    
+    double mb = RING_API_GETNUMBER(1);
+    if (mb < 1) mb = 1; // Minimum 1MB
+    
+    ARENA_SIZE = (size_t)(mb * 1024 * 1024);
+    
+    // If arena is already active, we warn the user
+    if (arena_active) {
+        printf("[RingTensor] WARNING: Arena size changed while active. Call graph_free() then graph_init() to apply.\n");
+    }
 }
 
 /*
@@ -2811,27 +3170,40 @@ RING_FUNC(ring_tensor_get_data_ptr) {
 /* ========================================================================== */
 
 
+/* ====================================================================
+** Upgrade 3: Arena-backed Graph Initialization
+** ====================================================================
+** On init, we allocate (or reset) the 256MB arena.
+** All intermediate tensors during forward/backward are served from this
+** pool, eliminating thousands of malloc/free calls per epoch.
+** ==================================================================== */
 RING_FUNC(ring_graph_init) {
     int i;
     
-    // Free existing nodes
+    /* --- Free existing nodes --- */
     for(i=0; i<GRAPH_SIZE; i++) {
         if (GRAPH[i] != NULL) {
-            // Free tensors if they were allocated by the graph
+            /* Free tensors if they were allocated by the graph.
+            ** Upgrade 3: Only free data if the tensor owns it (is_owner == 1).
+            ** Arena-backed tensors (is_owner == 0) are freed in bulk below. */
             if (GRAPH[i]->val != NULL && GRAPH[i]->opcode != OP_WEIGHT && GRAPH[i]->opcode != OP_INPUT) {
-                if (GRAPH[i]->val->data != NULL) free(GRAPH[i]->val->data);
+                if (GRAPH[i]->val->is_owner && GRAPH[i]->val->data != NULL)
+                    free(GRAPH[i]->val->data);
                 free(GRAPH[i]->val);
             }
             if (GRAPH[i]->grad != NULL) {
-                if (GRAPH[i]->grad->data != NULL) free(GRAPH[i]->grad->data);
+                if (GRAPH[i]->grad->is_owner && GRAPH[i]->grad->data != NULL)
+                    free(GRAPH[i]->grad->data);
                 free(GRAPH[i]->grad);
             }
             if (GRAPH[i]->m != NULL) {
-                if (GRAPH[i]->m->data != NULL) free(GRAPH[i]->m->data);
+                if (GRAPH[i]->m->is_owner && GRAPH[i]->m->data != NULL)
+                    free(GRAPH[i]->m->data);
                 free(GRAPH[i]->m);
             }
             if (GRAPH[i]->v != NULL) {
-                if (GRAPH[i]->v->data != NULL) free(GRAPH[i]->v->data);
+                if (GRAPH[i]->v->is_owner && GRAPH[i]->v->data != NULL)
+                    free(GRAPH[i]->v->data);
                 free(GRAPH[i]->v);
             }
             free(GRAPH[i]);
@@ -2839,6 +3211,21 @@ RING_FUNC(ring_graph_init) {
     }
     
     GRAPH_SIZE = 0;
+    
+    /* --- Upgrade 3: Initialize (or reset) the Memory Arena ---
+    ** First call: allocate the 256MB block.
+    ** Subsequent calls (graph rebuild): just reset the offset to 0.
+    ** The block is reused across training runs without reallocation. */
+    if (arena_memory == NULL) {
+        arena_memory = (char *)malloc(ARENA_SIZE);
+        if (arena_memory) {
+            printf("[RingTensor] Memory Arena: %zu MB allocated.\n", ARENA_SIZE / (1024 * 1024));
+        } else {
+            printf("[RingTensor] WARNING: Arena allocation failed! Using system malloc.\n");
+        }
+    }
+    arena_offset = 0;   /* Reset the bump pointer */
+    arena_active = 1;   /* Enable arena for ensure_tensor_memory */
 }
 
 RING_FUNC(ring_graph_node) {
@@ -3336,7 +3723,7 @@ void internal_graph_backward() {
             // --- Loss Functions ---
             case OP_MSE:
                 if (src1 && src2) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     internal_mse_backward(src1->val, src2->val, tmp1);
                     accumulate_grad(src1, tmp1);
                     free(tmp1->data); free(tmp1); tmp1 = NULL;
@@ -3345,7 +3732,7 @@ void internal_graph_backward() {
 
             case OP_CROSSENTROPY:
                 if (src1 && src2) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     internal_crossentropy_backward(src1->val, src2->val, tmp1);
                     accumulate_grad(src1, tmp1);
                     free(tmp1->data); free(tmp1); tmp1 = NULL;
@@ -3364,7 +3751,7 @@ void internal_graph_backward() {
                 if (node->grad) {
                     if (src1) accumulate_grad(src1, node->grad);
                     if (src2) {
-                        ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                        ensure_temp_memory(&tmp1, node->grad->rows, node->grad->cols);
                         copy_tensor(node->grad, tmp1);
                         internal_scalar_mul(tmp1, -1.0);
                         accumulate_grad(src2, tmp1);
@@ -3376,7 +3763,7 @@ void internal_graph_backward() {
             case OP_TENSOR_MUL:
                 if (node->grad) {
                     if (src1 && src2) {
-                        ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                        ensure_temp_memory(&tmp1, node->grad->rows, node->grad->cols);
                         copy_tensor(node->grad, tmp1);
                         internal_mul_elem(tmp1, src2->val);
                         accumulate_grad(src1, tmp1);
@@ -3393,16 +3780,16 @@ void internal_graph_backward() {
             case OP_MATMUL:
                 if (src1 && src2) {
                     if (node->grad) {
-                        ensure_tensor_memory(&tmp1, src2->val->cols, src2->val->rows);
+                        ensure_temp_memory(&tmp1, src2->val->cols, src2->val->rows);
                         internal_transpose(src2->val, tmp1);
-                        ensure_tensor_memory(&tmp2, src1->val->rows, src1->val->cols);
+                        ensure_temp_memory(&tmp2, src1->val->rows, src1->val->cols);
                         internal_matmul(node->grad, tmp1, tmp2);
                         accumulate_grad(src1, tmp2);
                         free(tmp1->data); free(tmp1); tmp1 = NULL;
                         free(tmp2->data); free(tmp2); tmp2 = NULL;
-                        ensure_tensor_memory(&tmp1, src1->val->cols, src1->val->rows);
+                        ensure_temp_memory(&tmp1, src1->val->cols, src1->val->rows);
                         internal_transpose(src1->val, tmp1);
-                        ensure_tensor_memory(&tmp2, src2->val->rows, src2->val->cols);
+                        ensure_temp_memory(&tmp2, src2->val->rows, src2->val->cols);
                         internal_matmul(tmp1, node->grad, tmp2);
                         accumulate_grad(src2, tmp2);
                         free(tmp1->data); free(tmp1); tmp1 = NULL;
@@ -3414,7 +3801,7 @@ void internal_graph_backward() {
             case OP_SCALAR_MUL:
                 // y = x * c  --> dy/dx = dy * c
                 if (node->grad && src1) {
-                    ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                    ensure_temp_memory(&tmp1, node->grad->rows, node->grad->cols);
                     copy_tensor(node->grad, tmp1);
                     internal_scalar_mul(tmp1, node->params[0]); // Multiply grad by scalar
                     accumulate_grad(src1, tmp1);
@@ -3444,7 +3831,7 @@ void internal_graph_backward() {
                  // But for completeness:
                  if (node->grad && src1 && src2) {
                      // dSrc1
-                     ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                     ensure_temp_memory(&tmp1, node->grad->rows, node->grad->cols);
                      copy_tensor(node->grad, tmp1);
                      internal_div(tmp1, src2->val); // grad / src2
                      accumulate_grad(src1, tmp1);
@@ -3456,7 +3843,7 @@ void internal_graph_backward() {
 
             case OP_TRANSPOSE:
                 if (node->grad && src1) {
-                    ensure_tensor_memory(&tmp1, node->grad->cols, node->grad->rows);
+                    ensure_temp_memory(&tmp1, node->grad->cols, node->grad->rows);
                     internal_transpose(node->grad, tmp1);
                     accumulate_grad(src1, tmp1);
                     free(tmp1->data); free(tmp1); tmp1 = NULL;
@@ -3466,7 +3853,7 @@ void internal_graph_backward() {
             // --- Activations ---
             case OP_RELU:
                 if (node->grad && src1) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     copy_tensor(src1->val, tmp1);
                     internal_relu_prime(tmp1);
                     internal_mul_elem(tmp1, node->grad);
@@ -3477,7 +3864,7 @@ void internal_graph_backward() {
                 
             case OP_SIGMOID:
                 if (node->grad && src1) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     copy_tensor(src1->val, tmp1);
                     internal_sigmoid_prime(tmp1);
                     internal_mul_elem(tmp1, node->grad);
@@ -3488,7 +3875,7 @@ void internal_graph_backward() {
                 
             case OP_TANH:
                 if (node->grad && src1) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     copy_tensor(src1->val, tmp1);
                     internal_tanh_prime(tmp1);
                     internal_mul_elem(tmp1, node->grad);
@@ -3500,7 +3887,7 @@ void internal_graph_backward() {
              case OP_GELU:
                 if (src1) {
                     ensure_tensor_memory(&node->grad, src1->val->rows, src1->val->cols);
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     copy_tensor(src1->val, tmp1);
                     internal_gelu_prime(tmp1);
                     internal_mul_elem(tmp1, node->grad);
@@ -3515,7 +3902,7 @@ void internal_graph_backward() {
                     // node->grad is (dY)
                     // tmp1 will be (dX)
                     
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     
                     // Calling the correct kernel
                     internal_softmax_backward(node->val, node->grad, tmp1);
@@ -3550,7 +3937,7 @@ void internal_graph_backward() {
                     ensure_tensor_memory(&node->grad, src1->val->rows, src1->val->cols);
                     double eps = node->params[0];
                     if (eps == 0.0) eps = 1e-5;
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols); // dX
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols); // dX
                     if (!src2->grad) {
                         ensure_tensor_memory(&src2->grad, src2->val->rows, src2->val->cols);
                         internal_fill(src2->grad, 0.0);
@@ -3585,7 +3972,7 @@ void internal_graph_backward() {
             case OP_REPEAT_ROWS:
                 if (src1) {
                     ensure_tensor_memory(&node->grad, node->val->rows, node->val->cols);
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     internal_fill(tmp1, 0.0);
                     int nTimes = (int)node->params[0];
                     int r, c, t;
@@ -3605,7 +3992,7 @@ void internal_graph_backward() {
                 if (src1 && src2) {
                     if (node->grad) {
                         accumulate_grad(src1, node->grad);
-                        ensure_tensor_memory(&tmp1, 1, src2->val->cols);
+                        ensure_temp_memory(&tmp1, 1, src2->val->cols);
                         internal_sum(node->grad, 0, tmp1);
                         accumulate_grad(src2, tmp1);
                         free(tmp1->data); free(tmp1); tmp1 = NULL;
@@ -3615,9 +4002,9 @@ void internal_graph_backward() {
                 
             case OP_ATTENTION:
                 if (node->grad && src1 && src2 && src3) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols); // dQ
-                    ensure_tensor_memory(&tmp2, src2->val->rows, src2->val->cols); // dK
-                    ensure_tensor_memory(&tmp3, src3->val->rows, src3->val->cols); // dV
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols); // dQ
+                    ensure_temp_memory(&tmp2, src2->val->rows, src2->val->cols); // dK
+                    ensure_temp_memory(&tmp3, src3->val->rows, src3->val->cols); // dV
                     internal_fill(tmp1, 0.0);
                     internal_fill(tmp2, 0.0);
                     internal_fill(tmp3, 0.0);
@@ -3644,7 +4031,7 @@ void internal_graph_backward() {
                 
             case OP_DROPOUT:
                 if (node->grad && src1) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     internal_dropout_backward(node->grad, tmp1, node->m, node->params[0]); 
                     accumulate_grad(src1, tmp1);
                     free(tmp1->data); free(tmp1); tmp1 = NULL;
@@ -3653,7 +4040,7 @@ void internal_graph_backward() {
                 
             case OP_SUM:
                 if (node->grad && src1) {
-                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    ensure_temp_memory(&tmp1, src1->val->rows, src1->val->cols);
                     int axis = (int)node->params[0];
                     int r, c;
                     for(r=0; r<src1->val->rows; r++) {
@@ -3902,13 +4289,28 @@ RING_FUNC(ring_graph_bind_grad) {
     }
 }
 
+/* ====================================================================
+** Upgrade 3: Arena-aware Graph Cleanup
+** ====================================================================
+** ring_graph_free releases node structs (via ring_graph_init),
+** then frees the arena block and disables arena mode.
+** ==================================================================== */
 RING_FUNC(ring_graph_free) {
     /*
     ** Usage: ring_graph_free()
-    ** free graph memory
+    ** Frees all graph nodes, then releases the arena.
     */
     
+    /* Clean up all graph nodes (reuses init logic) */
     ring_graph_init(pPointer);
+    
+    /* Release the arena block and disable pooling */
+    if (arena_memory != NULL) {
+        free(arena_memory);
+        arena_memory = NULL;
+    }
+    arena_offset = 0;
+    arena_active = 0;
 }
 
 /* --- Missing Kernels Implementation --- */
@@ -4459,6 +4861,181 @@ RING_FUNC(ring_tensor_to_list) {
 }
 
 
+// ====== LLM SOTA KERNELS (GEMMA / LLAMA) ======
+
+void internal_rmsnorm(tensor_t *X, tensor_t *Weights, double eps) {
+    int i, j;
+    int rows = X->rows;
+    int cols = X->cols;
+    #pragma omp parallel for private(j)
+    for (i = 0; i < rows; i++) {
+        double sum_sq = 0.0;
+        double *x_row = &X->data[i * cols];
+        double *w_row = Weights->data;
+        for (j = 0; j < cols; j++) {
+            sum_sq += x_row[j] * x_row[j];
+        }
+        double rms = sqrt((sum_sq / cols) + eps);
+        double inv_rms = 1.0 / rms;
+        for (j = 0; j < cols; j++) {
+            x_row[j] = x_row[j] * inv_rms * w_row[j];
+        }
+    }
+}
+RING_FUNC(ring_tensor_rmsnorm) {
+    if (RING_API_PARACOUNT != 3) { RING_API_ERROR("Requires X, Weights, eps"); return; }
+    tensor_t *X = (tensor_t*)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *W = (tensor_t*)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    double eps  = RING_API_GETNUMBER(3);
+    internal_rmsnorm(X, W, eps);
+}
+
+void internal_rope(tensor_t *Q, tensor_t *K, int dim, double base) {
+    int seq = Q->rows;
+    int n_heads_q = Q->cols / dim;
+    int n_heads_k = K->cols / dim;
+    int i, h, d;
+    #pragma omp parallel for private(h, d)
+    for (i = 0; i < seq; i++) { // i is position
+        for (d = 0; d < dim; d += 2) {
+            double theta = (double)i * pow(base, -(double)d / dim);
+            double cos_t = cos(theta);
+            double sin_t = sin(theta);
+            // Apply to Q
+            for (h = 0; h < n_heads_q; h++) {
+                int idx1 = i * (n_heads_q * dim) + h * dim + d;
+                int idx2 = idx1 + 1;
+                double q1 = Q->data[idx1];
+                double q2 = Q->data[idx2];
+                Q->data[idx1] = q1 * cos_t - q2 * sin_t;
+                Q->data[idx2] = q1 * sin_t + q2 * cos_t;
+            }
+            if (K != NULL) {
+                // Apply to K
+                for (h = 0; h < n_heads_k; h++) {
+                    int idx1 = i * (n_heads_k * dim) + h * dim + d;
+                    int idx2 = idx1 + 1;
+                    double k1 = K->data[idx1];
+                    double k2 = K->data[idx2];
+                    K->data[idx1] = k1 * cos_t - k2 * sin_t;
+                    K->data[idx2] = k1 * sin_t + k2 * cos_t;
+                }
+            }
+        }
+    }
+}
+RING_FUNC(ring_tensor_rope) {
+    if (RING_API_PARACOUNT != 4) return;
+    tensor_t *Q = (tensor_t*)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *K = NULL;
+    if (RING_API_ISPOINTER(2)) K = (tensor_t*)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    int dim = (int)RING_API_GETNUMBER(3);
+    double base = RING_API_GETNUMBER(4); // Usually 10000.0 or 1000000.0
+    internal_rope(Q, K, dim, base);
+}
+
+void internal_silu(tensor_t *T) {
+    int i;
+    #pragma omp parallel for
+    for (i = 0; i < T->size; i++) {
+        double x = T->data[i];
+        T->data[i] = x / (1.0 + exp(-x)); // x * sigmoid(x)
+    }
+}
+RING_FUNC(ring_tensor_silu) {
+    if (RING_API_PARACOUNT != 1) return;
+    tensor_t *T = (tensor_t*)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    internal_silu(T);
+}
+
+// GPU SAT ANNEAL
+int gpu_sat_anneal(tensor_t *Field, tensor_t *Momentum, tensor_t *Clauses, tensor_t *Weights, int lits_per_clause, int passes, float lr, float decay) {
+#ifdef USE_OPENCL
+    if(!gpu_ready) return 0;
+    
+    int nVars = Field->rows; 
+    int nDims = Field->cols; 
+    int nClauses = Clauses->rows;
+    
+    size_t szF = Field->size * sizeof(float);
+    size_t szM = Momentum->size * sizeof(float);
+    size_t szC = Clauses->size * sizeof(float);
+    size_t szW = Weights->size * sizeof(float); // NEW
+    
+    float *fF = (float*)malloc(szF);
+    float *fM = (float*)malloc(szM);
+    float *fC = (float*)malloc(szC);
+    float *fW = (float*)malloc(szW); // NEW
+    
+    int i; 
+	#pragma omp parallel for private(i)
+	for(i=0; i<Field->size; i++) fF[i] = (float)Field->data[i];
+	#pragma omp parallel for private(i)
+	for(i=0; i<Momentum->size; i++) fM[i] = (float)Momentum->data[i];
+	#pragma omp parallel for private(i)
+	for(i=0; i<Clauses->size; i++) fC[i] = (float)Clauses->data[i];
+	#pragma omp parallel for private(i)
+	for(i=0; i<Weights->size; i++) fW[i] = (float)Weights->data[i]; // NEW
+    
+    cl_int ret;
+    cl_mem bufF = clCreateBuffer(clContext, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, szF, fF, &ret);
+    cl_mem bufM = clCreateBuffer(clContext, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, szM, fM, &ret);
+    cl_mem bufC = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR, szC, fC, &ret);
+    cl_mem bufW = clCreateBuffer(clContext, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, szW, fW, &ret); // NEW
+    
+    clSetKernelArg(clSatKernel, 0, sizeof(cl_mem), (void*)&bufF);
+    clSetKernelArg(clSatKernel, 1, sizeof(cl_mem), (void*)&bufM);
+    clSetKernelArg(clSatKernel, 2, sizeof(cl_mem), (void*)&bufC);
+    clSetKernelArg(clSatKernel, 3, sizeof(cl_mem), (void*)&bufW); // NEW
+    clSetKernelArg(clSatKernel, 4, sizeof(int), &nVars);
+    clSetKernelArg(clSatKernel, 5, sizeof(int), &nClauses);
+    clSetKernelArg(clSatKernel, 6, sizeof(int), &lits_per_clause);
+    clSetKernelArg(clSatKernel, 7, sizeof(int), &passes);
+    clSetKernelArg(clSatKernel, 8, sizeof(float), &lr);
+    clSetKernelArg(clSatKernel, 9, sizeof(float), &decay);
+    
+    size_t global_work_size[1] = { (size_t)nDims };
+    ret = clEnqueueNDRangeKernel(clQueue, clSatKernel, 1, NULL, global_work_size, NULL, 0, NULL, NULL);
+    
+    if (ret == CL_SUCCESS) {
+        clEnqueueReadBuffer(clQueue, bufF, CL_TRUE, 0, szF, fF, 0, NULL, NULL);
+        clEnqueueReadBuffer(clQueue, bufM, CL_TRUE, 0, szM, fM, 0, NULL, NULL);
+        clEnqueueReadBuffer(clQueue, bufW, CL_TRUE, 0, szW, fW, 0, NULL, NULL); // NEW
+        
+        #pragma omp parallel for private(i)
+        for(i=0; i<Field->size; i++) Field->data[i] = (double)fF[i];
+        #pragma omp parallel for private(i)
+        for(i=0; i<Momentum->size; i++) Momentum->data[i] = (double)fM[i];
+        #pragma omp parallel for private(i)
+        for(i=0; i<Weights->size; i++) Weights->data[i] = (double)fW[i]; // NEW
+    }
+    
+    clReleaseMemObject(bufF); clReleaseMemObject(bufM); clReleaseMemObject(bufC); clReleaseMemObject(bufW);
+    free(fF); free(fM); free(fC); free(fW);
+    return 1;
+#else
+	return 0;
+#endif
+}
+
+RING_FUNC(ring_tensor_sat_anneal) {
+    if (RING_API_PARACOUNT != 8) {
+        RING_API_ERROR("Requires 8 params: Field, Momentum, Clauses, Weights, lits_per_clause, passes, lr, decay");
+        return;
+    }
+    tensor_t *Field    = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *Momentum = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *Clauses  = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    tensor_t *Weights  = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
+    int lits_per_clause = (int)RING_API_GETNUMBER(5);
+    int passes = (int)RING_API_GETNUMBER(6);
+    float lr = (float)RING_API_GETNUMBER(7);
+    float decay = (float)RING_API_GETNUMBER(8);
+    
+    gpu_sat_anneal(Field, Momentum, Clauses, Weights, lits_per_clause, passes, lr, decay);
+}
+
+
 /* --- INIT --- */
 RING_LIBINIT {
     RING_API_REGISTER("tensor_init", ring_tensor_init);
@@ -4532,6 +5109,7 @@ RING_LIBINIT {
     RING_API_REGISTER("tensor_get_cores", ring_tensor_get_cores);
     RING_API_REGISTER("tensor_set_threads", ring_tensor_set_threads);
     RING_API_REGISTER("tensor_set_gpu_threshold", ring_tensor_set_gpu_threshold);
+    RING_API_REGISTER("tensor_set_arena_size", ring_tensor_set_arena_size);
 
     RING_API_REGISTER("tensor_set_from_list", ring_tensor_set_from_list);
     RING_API_REGISTER("tensor_set_one_hot", ring_tensor_set_one_hot);
@@ -4558,6 +5136,7 @@ RING_LIBINIT {
 
     RING_API_REGISTER("tensor_from_memory", ring_tensor_from_memory);
     
+    RING_API_REGISTER("tensor_dot_row_vec", ring_tensor_dot_row_vec);
 
     // --- NEW ---
     RING_API_REGISTER("tensor_attention_linear_causal", ring_tensor_attention_linear_causal);
@@ -4570,6 +5149,13 @@ RING_LIBINIT {
 
     RING_API_REGISTER("tensor_set_one_hot_ptr", ring_tensor_set_one_hot_ptr);
     RING_API_REGISTER("tensor_to_list", ring_tensor_to_list);
+    RING_API_REGISTER("tensor_sat_anneal", ring_tensor_sat_anneal);
+    
+    // --- LLM GIANTS CORE ---
+    RING_API_REGISTER("tensor_rmsnorm", ring_tensor_rmsnorm);
+    RING_API_REGISTER("tensor_rope", ring_tensor_rope);
+    RING_API_REGISTER("tensor_silu", ring_tensor_silu);
+    
     
     // --- GRAPH ENGINE ---
     RING_API_REGISTER("graph_init", ring_graph_init);

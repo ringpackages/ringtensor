@@ -1,7 +1,7 @@
 # RingTensor API Reference
 
-**Version:** 1.3.2  
-**Last Updated:** 2026-01-26
+**Version:** 1.3.4  
+**Last Updated:** 2026-05-07
 
 This document provides a comprehensive reference for all RingTensor functions, organized by category.
 
@@ -1886,8 +1886,8 @@ Error: Invalid axis (must be 0 or 1)
 
 ## Version Compatibility
 
-- **Ring Language**: 1.25+
-- **RingTensor**: 1.3.2
+- **Ring Language**: 1.26+
+- **RingTensor**: 1.3.4
 
 **Backward Compatibility:**
 - Version 1.3.x is fully compatible with 1.2.x and 1.1.x
@@ -1903,6 +1903,6 @@ Error: Invalid axis (must be 0 or 1)
 
 ---
 
-**Last Updated:** 2026-01-26  
-**Version:** 1.3.2
+**Last Updated:** 2026-05-07  
+**Version:** 1.3.4
 **Author:** Azzeddine Remmal

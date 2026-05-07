@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# 1️⃣ تحديد المسارات
+#  تحديد المسارات
 ROOT="$PWD/../.."
 SRC="$PWD"
 LIB_DIR="$ROOT/lib"

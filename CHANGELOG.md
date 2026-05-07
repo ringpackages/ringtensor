@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.4] - 2026-05-07
+
+### Added
+
+- `ring_tensor_set_arena_size` - Configures arena allocation size (GB)
+- `ring_tensor_rmsnorm` - RMS Norm (LLM specific)
+- `ring_tensor_rope` - RoPE embeddings (LLM specific)
+- `ring_tensor_silu` - SiLU activation (LLM specific)
+- `ring_tensor_dot_row_vec` - Efficient row vector dot product
+
+### Changed
+
+- Updated C++ API documentation
+- Added optimization notes for arena memory usage
+
+
+---
+
 ## [1.3.3] - 2026-01-30
 
 ### Added
